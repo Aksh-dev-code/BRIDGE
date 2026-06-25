@@ -8,7 +8,7 @@ import time
 DATA_DIR = "./Custom_Data"
 DATASET_SIZE = 50
 CAMERA_INDEX = 0
-CAPTURE_DELAY = 1
+CAPTURE_DELAY = .5
 IMAGE_SIZE = 224
 
 # Hand Placement Box -  ROI 
