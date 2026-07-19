@@ -2,21 +2,27 @@ import os
 import cv2
 import time
 
-
 # CONFIGURATION
 
-DATA_DIR = "./Custom_Data"
-DATASET_SIZE = 50
-CAMERA_INDEX = 0
-CAPTURE_DELAY = .5
+DATA_DIR = "./Dataset"
+DATASET_SIZE = 200
+CAPTURE_DELAY = 0
 IMAGE_SIZE = 224
 
-# Hand Placement Box -  ROI 
-X1, Y1 = 150, 50
-X2, Y2 = 450, 350
+
+# CAMERA SOURCE
+CAMERA_SOURCE =  "http://10.118.2.94:8080/video"
+ 
+MAX_READ_RETRIES = 30
+RECONNECT_DELAY = 1.5  
+
+# Hand Placement Box - ROI
+X1, Y1 = 300, 50
+X2, Y2 = 750, 500
 
 
-# Class_names
+# Classes
+
 CLASS_NAMES = {}
 
 for i, ch in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ"):
@@ -28,20 +34,82 @@ for i, digit in enumerate("123456789"):
 NUMBER_OF_CLASSES = len(CLASS_NAMES)
 
 
-# folder creation
+# Folder creation
 os.makedirs(DATA_DIR, exist_ok=True)
 
 for label in CLASS_NAMES.values():
     os.makedirs(os.path.join(DATA_DIR, label), exist_ok=True)
 
+
+# Camera connection helpers
+
+def open_camera(source):
+    """Open a camera / stream and verify it actually delivers frames."""
+    print(f"Connecting to camera source: {source} ...")
+    cam = cv2.VideoCapture(source)
+
+    if not cam.isOpened():
+        raise RuntimeError(
+            f"Cannot open camera source '{source}'.\n"
+            f"If this is a phone stream, check that:\n"
+            f"  1. The phone app's server is running.\n"
+            f"  2. Phone and laptop are on the SAME WiFi network.\n"
+            f"  3. The URL matches exactly what the app shows "
+            f"(including '/video' if required)."
+        )
+
+    # Try a few times to get the first real frame - phone streams
+    # can take a moment to start delivering data.
+    for _ in range(MAX_READ_RETRIES):
+        ret, frame = cam.read()
+        if ret and frame is not None:
+            h, w = frame.shape[:2]
+            print(f"Camera connected. Frame size: {w}x{h}")
+            return cam
+        time.sleep(0.1)
+
+    cam.release()
+    raise RuntimeError(
+        "Camera opened but no frames were received. "
+        "Check the stream URL / app and try again."
+    )
+
+
+def read_frame_safe(cam, source):
+    """
+    Read a frame, retrying and reconnecting if needed.
+    Returns (cam, frame). Raises SystemExit if it truly can't recover.
+    """
+    for attempt in range(MAX_READ_RETRIES):
+        ret, frame = cam.read()
+        if ret and frame is not None:
+            return cam, frame
+        time.sleep(0.05)
+
+    # Frame reads kept failing -> try a full reconnect (common with
+    # phone WiFi streams that briefly drop).
+    print("Lost connection to camera, attempting to reconnect...")
+    cam.release()
+    time.sleep(RECONNECT_DELAY)
+
+    try:
+        cam = open_camera(source)
+    except RuntimeError as e:
+        print(f"Reconnect failed: {e}")
+        cv2.destroyAllWindows()
+        raise SystemExit
+
+    ret, frame = cam.read()
+    if not ret or frame is None:
+        cv2.destroyAllWindows()
+        raise SystemExit("Camera reconnected but still no frames. Exiting.")
+
+    return cam, frame
+
+
 # Open camera
 
-cap = cv2.VideoCapture(CAMERA_INDEX)
-
-if not cap.isOpened():
-    raise RuntimeError(
-        f"Cannot open camera index {CAMERA_INDEX}"
-    )
+cap = open_camera(CAMERA_SOURCE)
 
 print("\n=== ISL Dataset Collection ===")
 print(f"Classes      : {NUMBER_OF_CLASSES}")
@@ -49,7 +117,8 @@ print(f"Images/Class : {DATASET_SIZE}")
 print(f"Save Path    : {os.path.abspath(DATA_DIR)}\n")
 
 
-# loop for start , skip and exit 
+
+# Main loop - start / skip / exit per class
 
 for class_id in range(NUMBER_OF_CLASSES):
 
@@ -59,64 +128,37 @@ for class_id in range(NUMBER_OF_CLASSES):
     print(f"\n[{class_id+1}/{NUMBER_OF_CLASSES}] Class: {class_label}")
     print("Press Q = Start | S = Skip | ESC = Exit")
 
-    # wait screen
-    
+    # ---- wait screen ----
     while True:
 
-        ret, frame = cap.read()
-
-        if not ret:
-            continue
-
+        cap, frame = read_frame_safe(cap, CAMERA_SOURCE)
         frame = cv2.flip(frame, 1)
 
-        # ROI box
-        cv2.rectangle(
-            frame,
-            (X1, Y1),
-            (X2, Y2),
-            (0, 255, 0),
-            2
+        cv2.rectangle(frame, (X1, Y1), (X2, Y2), (0, 255, 0), 2)
+
+        cv2.putText(
+            frame, "PLACE HAND HERE", (X1, Y1 - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
         )
 
         cv2.putText(
-            frame,
-            "PLACE HAND HERE",
-            (X1, Y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2
+            frame, f"Class: {class_label}", (10, 40),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
         )
 
         cv2.putText(
-            frame,
-            f"Class: {class_label}",
-            (10, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2
-        )
-
-        cv2.putText(
-            frame,
-            "Q=Start  S=Skip  ESC=Exit",
-            (10, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 255),
-            2
+            frame, "Q=Start  S=Skip  ESC=Exit", (10, 80),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
         )
 
         cv2.imshow("ISL Dataset Collection", frame)
 
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord("q") or key == ord("Q"):
+        if key in (ord("q"), ord("Q")):
             break
 
-        elif key == ord("s") or key == ord("S"):
+        elif key in (ord("s"), ord("S")):
             print(f"Skipped {class_label}")
             class_label = None
             break
@@ -129,113 +171,62 @@ for class_id in range(NUMBER_OF_CLASSES):
     if class_label is None:
         continue
 
-
-    # countdown 
-    
+    # ---- countdown ----
     for countdown in range(3, 0, -1):
 
-        ret, frame = cap.read()
-
-        if not ret:
-            continue
-
+        cap, frame = read_frame_safe(cap, CAMERA_SOURCE)
         frame = cv2.flip(frame, 1)
 
-        cv2.rectangle(
-            frame,
-            (X1, Y1),
-            (X2, Y2),
-            (0, 255, 0),
-            2
-        )
+        cv2.rectangle(frame, (X1, Y1), (X2, Y2), (0, 255, 0), 2)
 
         cv2.putText(
-            frame,
-            str(countdown),
-            (280, 250),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            4,
-            (0, 0, 255),
-            6
+            frame, str(countdown), (280, 250),
+            cv2.FONT_HERSHEY_SIMPLEX, 4, (0, 0, 255), 6
         )
 
         cv2.imshow("ISL Dataset Collection", frame)
         cv2.waitKey(1000)
 
-    #  captures images
-
+    # ---- capture images ----
     print(f"Capturing {DATASET_SIZE} images...")
 
     count = 0
 
     while count < DATASET_SIZE:
 
-        ret, frame = cap.read()
-
-        if not ret:
-            continue
-
+        cap, frame = read_frame_safe(cap, CAMERA_SOURCE)
         frame = cv2.flip(frame, 1)
 
         roi = frame[Y1:Y2, X1:X2]
-        roi = cv2.resize(
-            roi,
-            (IMAGE_SIZE, IMAGE_SIZE)
-        )
 
-        img_path = os.path.join(
-            class_dir,
-            f"{count}.jpg"
-        )
+        if roi.size == 0:
+            # ROI fell outside the frame 
+            print(
+                "Warning: ROI box is outside the camera frame. "
+                "Adjust X1,Y1,X2,Y2 to match your camera's resolution."
+            )
+            continue
 
+        roi = cv2.resize(roi, (IMAGE_SIZE, IMAGE_SIZE))
+
+        img_path = os.path.join(class_dir, f"{count}.jpg")
         cv2.imwrite(img_path, roi)
 
         display = frame.copy()
 
-        # ROI BOX
-        cv2.rectangle(
-            display,
-            (X1, Y1),
-            (X2, Y2),
-            (0, 255, 0),
-            2
-        )
+        cv2.rectangle(display, (X1, Y1), (X2, Y2), (0, 255, 0), 2)
 
-        # progress bar
-        progress = int(
-            (count / DATASET_SIZE) * 300
-        )
+        progress = int((count / DATASET_SIZE) * 300)
 
-        cv2.rectangle(
-            display,
-            (20, 420),
-            (320, 450),
-            (255, 255, 255),
-            2
-        )
-
-        cv2.rectangle(
-            display,
-            (20, 420),
-            (20 + progress, 450),
-            (0, 255, 0),
-            -1
-        )
+        cv2.rectangle(display, (20, 420), (320, 450), (255, 255, 255), 2)
+        cv2.rectangle(display, (20, 420), (20 + progress, 450), (0, 255, 0), -1)
 
         cv2.putText(
-            display,
-            f"{class_label} [{count+1}/{DATASET_SIZE}]",
-            (20, 400),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 255, 255),
-            2
+            display, f"{class_label} [{count+1}/{DATASET_SIZE}]", (20, 400),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2
         )
 
-        cv2.imshow(
-            "ISL Dataset Collection",
-            display
-        )
+        cv2.imshow("ISL Dataset Collection", display)
 
         key = cv2.waitKey(1) & 0xFF
 
@@ -245,12 +236,11 @@ for class_id in range(NUMBER_OF_CLASSES):
             raise SystemExit
 
         count += 1
-
         time.sleep(CAPTURE_DELAY)
 
     print(f"✓ Saved {count} images for {class_label}")
 
-# clean
+
 cap.release()
 cv2.destroyAllWindows()
 
