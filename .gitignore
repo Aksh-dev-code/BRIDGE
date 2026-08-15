@@ -1,1 +1,15 @@
 Notebooks/Static Sing Recognition.ipynb
+
+.venv/
+.env
+venvclea
+
+# datasets & derived arrays
+data/
+Dataset/
+
+# downloaded MediaPipe .task files
+models/mp_models/
+
+__pycache__/
+*.pyc
