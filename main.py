@@ -24,6 +24,7 @@ def cmd_train(args):
         batch_size=args.batch_size,
         lr=args.lr,
         resume=args.resume,
+        split=args.split,
     )
 
     if not args.no_eval:
@@ -65,10 +66,13 @@ def cmd_run(args):
         source=args.source,
         topk=args.topk,
         threshold=args.threshold,
+        margin=args.margin,
         swap_hands=args.swap_hands,
         mirror=not args.no_mirror,
-        idle_reset=args.idle_reset,
-        stability=args.stability,
+        min_duration=args.min_duration,
+        max_duration=args.max_duration,
+        end_silence=args.end_silence,
+        debug=args.debug,
     )
     return 0
 
@@ -80,6 +84,14 @@ def cmd_eval(args):
         print(f"No trained model at {config.MODEL_BUNDLE}. Run `python main.py train` first.")
         return 1
     evaluate(plots=not args.no_plots, show=False if args.no_show else None)
+    return 0
+
+
+def cmd_diagnose(args):
+    from src.diagnose import diagnose
+
+    diagnose(n=args.samples, seconds=args.seconds, source=args.source,
+             skip_live=args.no_camera)
     return 0
 
 
@@ -96,6 +108,10 @@ def build_parser():
     t.add_argument("--rebuild-data", action="store_true",
                    help="re-encode the .pkl dataset instead of using cached X.npy/y.npy")
     t.add_argument("--resume", action="store_true", help="warm-start from the best checkpoint")
+    t.add_argument("--split", choices=("auto", "official", "random"), default="auto",
+                   help="auto: use INCLUDE's official signer-disjoint split when it's "
+                        "available, else random; official: require it; random: force the "
+                        "old random stratified split")
     t.add_argument("--no-eval", action="store_true", help="skip evaluation after training")
     t.add_argument("--no-plots", action="store_true", help="skip writing plots to results/")
     t.add_argument("--no-show", action="store_true",
@@ -108,13 +124,18 @@ def build_parser():
                    help="camera index (0) or stream URL, e.g. http://10.0.0.5:8080/video")
     r.add_argument("--video", help="classify a video file instead of a live camera")
     r.add_argument("--topk", type=int, default=3, help="how many predictions to show")
-    r.add_argument("--threshold", type=float, default=0.35,
-                   help="minimum confidence for a window to count toward a commit")
-    r.add_argument("--stability", type=int, default=5,
-                   help="consecutive windows that must agree before a sign is committed "
-                        "(lower = faster but twitchier)")
-    r.add_argument("--idle-reset", type=int, default=8,
-                   help="frames with no hands visible that end a sign and clear the window")
+    r.add_argument("--threshold", type=float, default=0.5,
+                   help="minimum smoothed confidence to commit a sign")
+    r.add_argument("--margin", type=float, default=0.15,
+                   help="how far the top guess must beat the runner-up to commit")
+    r.add_argument("--min-duration", type=float, default=0.5,
+                   help="shortest gesture that counts as a sign (seconds)")
+    r.add_argument("--max-duration", type=float, default=6.0,
+                   help="a gesture is force-ended after this long (seconds)")
+    r.add_argument("--end-silence", type=float, default=0.5,
+                   help="seconds with hands down that end the current sign")
+    r.add_argument("--debug", action="store_true",
+                   help="show live fps / buffer / hand-coverage numbers on the preview")
     r.add_argument("--swap-hands", action="store_true",
                    help="swap left/right hand blocks if predictions look mirrored")
     r.add_argument("--no-mirror", action="store_true", help="don't mirror the preview window")
@@ -130,6 +151,16 @@ def build_parser():
     e.add_argument("--no-show", action="store_true",
                    help="save charts to results/ without opening them on screen")
     e.set_defaults(func=cmd_eval)
+
+    # --- diagnose ---
+    d = sub.add_parser("diagnose",
+                       help="compare training features against live camera features")
+    d.add_argument("--samples", type=int, default=40, help="how many .pkl files to inspect")
+    d.add_argument("--seconds", type=float, default=6.0, help="seconds of camera to capture")
+    d.add_argument("--source", default="0", help="camera index or stream URL")
+    d.add_argument("--no-camera", action="store_true",
+                   help="dataset stats only, don't open the camera")
+    d.set_defaults(func=cmd_diagnose)
 
     return p
 

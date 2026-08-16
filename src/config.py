@@ -44,6 +44,8 @@ INPUT_DIM = NUM_LANDMARKS * 3  # 225
 
 MAX_FRAMES = 40
 
+PREPROCESS_VERSION = 3
+
 # --- training defaults --------------------------------------------------
 EPOCHS = 100
 BATCH_SIZE = 32

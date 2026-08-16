@@ -8,7 +8,7 @@ from src.model import build_model, save_bundle
 
 
 def train(epochs=config.EPOCHS, rebuild_data=False, batch_size=config.BATCH_SIZE,
-          lr=config.LR, resume=False):
+          lr=config.LR, resume=False, split="auto"):
     dev = config.device()
     print(f"Device: {dev}")
 
@@ -16,7 +16,7 @@ def train(epochs=config.EPOCHS, rebuild_data=False, batch_size=config.BATCH_SIZE
     dataset.sanity_check(X, y)
     num_classes = len(class_names)
 
-    train_loader, val_loader = dataset.make_loaders(X, y, batch_size=batch_size)
+    train_loader, val_loader = dataset.make_loaders(X, y, batch_size=batch_size, split=split)
 
     model = build_model(num_classes).to(dev)
     if resume and config.BEST_CKPT.exists():

@@ -1,22 +1,37 @@
 """Inference: predict signs from a live camera or a video file."""
 
-from collections import deque
+import re
+import time
 
 import numpy as np
 import torch
 
-from src import config
+from src import config, preprocess
 from src.model import load_bundle
+
+# Dataset folders are named "13. Attack" (and one "Ex. Monsoon") — the index is
+# a dataset artifact, not part of the sign, so strip it everywhere a name is
+# shown to a human.
+_PREFIX = re.compile(r"^\s*(?:\d+|Ex)\.\s*")
+
+
+def pretty(name):
+    return _PREFIX.sub("", str(name)).strip()
+
+
+def predict_probs(model, seq, dev):
+    """seq: (max_frames, 225) -> (num_classes,) probability vector."""
+    x = torch.tensor(np.asarray(seq, dtype=np.float32)).unsqueeze(0).to(dev)
+    with torch.inference_mode():
+        return torch.softmax(model(x), dim=1)[0].float().cpu().numpy()
 
 
 def predict_sequence(model, class_names, seq, dev, topk=3):
     """seq: (max_frames, 225) -> list of (class_name, probability), best first."""
-    x = torch.tensor(np.asarray(seq, dtype=np.float32)).unsqueeze(0).to(dev)
-    with torch.no_grad():
-        probs = torch.softmax(model(x), dim=1)[0]
-    k = min(topk, probs.numel())
-    top = probs.topk(k)
-    return [(class_names[i], float(p)) for p, i in zip(top.values.cpu(), top.indices.cpu())]
+    probs = predict_probs(model, seq, dev)
+    k = min(topk, len(probs))
+    idx = np.argsort(probs)[::-1][:k]
+    return [(class_names[i], float(probs[i])) for i in idx]
 
 
 def predict_video(video_path, topk=3, swap_hands=False):
@@ -29,23 +44,25 @@ def predict_video(video_path, topk=3, swap_hands=False):
 
     print(f"\nPredictions for {video_path}:")
     for name, prob in preds:
-        print(f"  {name:30s} {prob:.3f}")
+        print(f"  {pretty(name):30s} {prob:.3f}")
     return preds
 
 
-def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True,
-                 idle_reset=8, stability=5, hold=45):
-    """Live recognition with gesture segmentation.
+def run_realtime(source=0, topk=3, threshold=0.5, margin=0.15, swap_hands=False, mirror=True,
+                 min_duration=0.5, max_duration=6.0, end_silence=0.5, hold=2.0, debug=False):
+    """Live recognition, segmented one sign at a time.
 
-    Frames stream into a fixed-length window, but a prediction is only
-    *committed* once the same label has won `stability` windows in a row above
-    `threshold`. Two things end a sign and clear the window, so one sign can
-    never bleed into the next:
+    Training encodes a whole clip — start of sign to end — resampled onto
+    MAX_FRAMES. So inference does the same thing: raise your hands to open a
+    gesture, sign it, drop your hands to close it. The completed gesture is then
+    passed through the identical preprocess.encode call the dataset uses.
 
-      - dropping your hands for `idle_reset` frames (a natural boundary), and
-      - committing a sign (the window restarts empty for the following one).
+    That is the whole reason for segmenting rather than classifying a sliding
+    window: a window covering half a sign is not something the model was ever
+    trained on, no matter how the confidence thresholds are tuned.
 
-    Keys: Q / ESC quit, R reset the window, C clear the history.
+    Keys: Q / ESC quit, R drop the current gesture, C clear the history,
+    D toggle debug.
     """
     import cv2
 
@@ -54,10 +71,8 @@ def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True
     dev = config.device()
     model, class_names, cfg = load_bundle(map_location=dev)
     max_len = cfg["max_len"]
-    stability = max(1, stability)
-    print(f"Loaded model: {len(class_names)} classes, window={max_len} frames, device={dev}")
+    names = [pretty(n) for n in class_names]
 
-    # Allow "0"/"1" to mean a local webcam index, anything else is a URL/path.
     if isinstance(source, str) and source.isdigit():
         source = int(source)
 
@@ -69,17 +84,43 @@ def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True
             "same WiFi, and the URL matches exactly (including '/video')."
         )
 
-    buffer = deque(maxlen=max_len)      # the last max_len frames of landmarks
-    votes = deque(maxlen=stability)     # recent top-1 labels, for agreement
-    history = []                        # signs committed so far
-    preds = []                          # live top-k, for display only
-    committed = None                    # (name, prob) of the last committed sign
-    committed_at = -10_000
-    idle = 0                            # consecutive frames with no hands
-    frame_idx = 0
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    frame_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 640.0
+    frame_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 480.0
+    aspect = frame_w / frame_h
+    print(f"Loaded model: {len(names)} classes, {max_len} frames per sign, device={dev}")
+    print(f"Camera {int(frame_w)}x{int(frame_h)} (aspect {aspect:.2f})")
 
-    print("Running. Q or ESC to quit, R to reset the window, C to clear history.")
+    kps, confs, seen = [], [], []   # the gesture currently being recorded
+    started_at = None
+    last_hands_at = None
+    history = []
+    preds = []               # preview of the in-progress gesture
+    committed = None
+    committed_at = -1e9
+    last_preview = 0.0
+    fps_ema = None
+    t0 = time.monotonic()
+    last_t = t0
+
+    def classify(k, c, s):
+        # Drop the trailing frames where the hands had already gone. They are
+        # what ends the gesture, not part of it, and leaving them in appends a
+        # frozen tail that no training clip has.
+        end = len(s) - 1
+        while end >= 0 and not s[end]:
+            end -= 1
+        if end < 0:
+            return None
+        seq = preprocess.encode(np.stack(k[:end + 1]), np.stack(c[:end + 1]),
+                                aspect=aspect, max_frames=max_len)
+        if seq is None:
+            return None
+        probs = predict_probs(model, seq, dev)
+        order = np.argsort(probs)[::-1]
+        return [(names[i], float(probs[i])) for i in order[:max(topk, 2)]]
+
+    print("Running. Raise your hands to start a sign, lower them to finish it.")
+    print("Q or ESC to quit, R to drop the current gesture, C to clear history.")
     with LandmarkExtractor(swap_hands=swap_hands) as ex:
         while True:
             ok, frame = cap.read()
@@ -87,46 +128,70 @@ def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True
                 print("Lost the camera feed.")
                 break
 
-            # Detect on the true (unmirrored) frame so handedness labels stay correct.
-            kp, hands_seen = ex.extract(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                        int(frame_idx * 1000 / fps))
-            frame_idx += 1
-            idle = 0 if hands_seen else idle + 1
+            now = time.monotonic()
+            dt, last_t = now - last_t, now
+            if dt > 0:
+                fps_ema = 1.0 / dt if fps_ema is None else 0.9 * fps_ema + 0.1 / dt
 
-            if idle >= idle_reset:
-                # Hands are down: the sign is over. Start the next one clean.
-                buffer.clear()
-                votes.clear()
-                preds = []
-            else:
-                buffer.append(kp.reshape(-1))
+            # Detect on the true (unmirrored) frame so handedness stays correct.
+            kp, conf, hands_seen = ex.extract(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                              int((now - t0) * 1000))
 
-            if len(buffer) == max_len:
-                preds = predict_sequence(model, class_names, np.array(buffer), dev, topk=topk)
-                name, prob = preds[0]
-                votes.append(name if prob >= threshold else None)
+            if hands_seen:
+                if started_at is None:
+                    started_at = now
+                    kps, confs, seen, preds = [], [], [], []
+                last_hands_at = now
 
-                # Commit only once the window has agreed with itself for a while;
-                # mid-transition windows flicker and never reach agreement.
-                if len(votes) == stability and votes[0] is not None and len(set(votes)) == 1:
-                    committed = (name, prob)
-                    committed_at = frame_idx
-                    history.append(name)
-                    print(f"  → {name}  ({prob:.2f})")
-                    buffer.clear()   # don't re-read the sign we just emitted
-                    votes.clear()
-                    preds = []
+            recording = started_at is not None
+            if recording:
+                # Keep buffering through brief detection dropouts — a hand lost
+                # mid-motion is a detector hiccup, not the end of the sign.
+                kps.append(kp)
+                confs.append(conf)
+                seen.append(bool(hands_seen))
+
+            duration = (now - started_at) if recording else 0.0
+            quiet = (now - last_hands_at) if last_hands_at is not None else 0.0
+            finished = recording and (quiet >= end_silence or duration >= max_duration)
+
+            if finished:
+                result = classify(kps, confs, seen) if duration >= min_duration else None
+                if result is None:
+                    if duration >= min_duration:
+                        print("  (couldn't read that one — keep your shoulders in frame)")
+                else:
+                    (n1, p1), (_, p2) = result[0], result[1]
+                    if p1 >= threshold and p1 - p2 >= margin:
+                        committed = (n1, p1)
+                        committed_at = now
+                        history.append(n1)
+                        print(f"  → {n1}  ({p1:.2f})")
+                    else:
+                        print(f"  ? unsure: {n1} {p1:.2f} / {result[1][0]} {p2:.2f}")
+                kps, confs, seen, preds = [], [], [], []
+                started_at = None
+
+            # Preview the partial gesture a few times a second, purely for the
+            # display — only the completed gesture is ever committed.
+            elif recording and duration >= min_duration and now - last_preview > 0.25:
+                last_preview = now
+                preds = classify(kps, confs, seen) or []
 
             display = cv2.flip(frame, 1) if mirror else frame.copy()
             _draw_overlay(cv2, display, {
-                "preds": preds,
-                "filled": len(buffer),
-                "max_len": max_len,
+                "preds": preds[:topk],
+                "recording": recording,
+                "duration": duration,
+                "max_duration": max_duration,
                 "hands_seen": hands_seen,
                 "committed": committed,
-                "fresh": frame_idx - committed_at < hold,
+                "fresh": now - committed_at < hold,
                 "history": history,
-                "state": _state_label(idle, idle_reset, len(buffer), max_len, votes, stability),
+                "state": _state_label(recording, duration, min_duration, quiet, end_silence),
+                "debug": debug,
+                "fps": fps_ema or 0.0,
+                "buffered": len(kps),
             })
             cv2.imshow("BRIDGE — Sign Recognition", display)
 
@@ -134,12 +199,12 @@ def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True
             if key in (27, ord("q"), ord("Q")):
                 break
             if key in (ord("r"), ord("R")):
-                buffer.clear()
-                votes.clear()
-                preds = []
+                kps, confs, seen, preds, started_at = [], [], [], [], None
             if key in (ord("c"), ord("C")):
                 history.clear()
                 committed = None
+            if key in (ord("d"), ord("D")):
+                debug = not debug
 
     cap.release()
     cv2.destroyAllWindows()
@@ -148,13 +213,14 @@ def run_realtime(source=0, topk=3, threshold=0.35, swap_hands=False, mirror=True
         print(f"\nRecognized {len(history)} signs: {' · '.join(history)}")
 
 
-def _state_label(idle, idle_reset, filled, max_len, votes, stability):
-    if idle >= idle_reset:
-        return "IDLE — raise your hands to sign"
-    if filled < max_len:
-        return f"READING {filled}/{max_len}"
-    agree = sum(1 for v in votes if v is not None and v == votes[-1])
-    return f"CONFIRMING {agree}/{stability}"
+def _state_label(recording, duration, min_duration, quiet, end_silence):
+    if not recording:
+        return "READY — raise your hands to start a sign"
+    if duration < min_duration:
+        return "RECORDING — keep going"
+    if quiet > 0.05:
+        return f"FINISHING in {max(0.0, end_silence - quiet):.1f}s — hands down to commit"
+    return f"RECORDING {duration:.1f}s — lower your hands when done"
 
 
 def _draw_overlay(cv2, img, s):
@@ -164,31 +230,37 @@ def _draw_overlay(cv2, img, s):
 
     cv2.rectangle(img, (0, 0), (w, 132), (0, 0, 0), -1)
 
-    # Last committed sign — the actual result, bright while fresh then dimmed.
-    if s["committed"]:
+    if s["committed"] and s["fresh"]:
         name, prob = s["committed"]
-        cv2.putText(img, f"{name}  ({prob:.2f})", (15, 45), font, 1.0,
-                    GREEN if s["fresh"] else DIM, 2)
+        cv2.putText(img, f"{name}  ({prob:.2f})", (15, 45), font, 1.0, GREEN, 2)
+    elif s["preds"]:
+        name, prob = s["preds"][0]
+        cv2.putText(img, f"{name}?  ({prob:.2f})", (15, 45), font, 0.9, AMBER, 2)
+    elif s["committed"]:
+        name, prob = s["committed"]
+        cv2.putText(img, f"{name}  ({prob:.2f})", (15, 45), font, 1.0, DIM, 2)
     else:
         cv2.putText(img, "waiting for a sign...", (15, 45), font, 0.85, GREY, 2)
 
-    # What the window is leaning toward right now (not committed yet).
-    if s["preds"]:
-        live = "  |  ".join(f"{n} {p:.2f}" for n, p in s["preds"][:3])
+    if s["preds"][1:]:
+        live = "  |  ".join(f"{n} {p:.2f}" for n, p in s["preds"][1:3])
         cv2.putText(img, live, (15, 75), font, 0.55, GREY, 1)
 
     cv2.putText(img, s["state"], (15, 100), font, 0.55, AMBER, 1)
 
     hand_color = GREEN if s["hands_seen"] else RED
     cv2.putText(img, f"hands: {s['hands_seen']}", (w - 150, 30), font, 0.6, hand_color, 2)
-    cv2.putText(img, "Q=quit  R=reset  C=clear", (w - 300, h - 15), font, 0.55, AMBER, 1)
+    if s["debug"]:
+        cv2.putText(img, f"{s['fps']:.1f} fps  frames={s['buffered']}",
+                    (w - 300, 55), font, 0.5, GREY, 1)
+    cv2.putText(img, "Q=quit  R=drop  C=clear  D=debug", (w - 380, h - 15), font, 0.55, AMBER, 1)
 
-    # Window-fill progress bar
-    bar = int((s["filled"] / s["max_len"]) * (w - 30))
+    # How long the current gesture has been running, against the cap.
+    frac = min(1.0, s["duration"] / s["max_duration"]) if s["max_duration"] else 0.0
     cv2.rectangle(img, (15, 114), (w - 15, 126), (80, 80, 80), 1)
-    cv2.rectangle(img, (15, 114), (15 + bar, 126), GREEN, -1)
+    if s["recording"]:
+        cv2.rectangle(img, (15, 114), (15 + int(frac * (w - 30)), 126), GREEN, -1)
 
-    # Running transcript of what's been recognized
     if s["history"]:
         tail = " · ".join(s["history"][-6:])
         cv2.rectangle(img, (0, h - 46), (w, h - 30), (0, 0, 0), -1)

@@ -102,6 +102,7 @@ class LandmarkExtractor:
         ensure_mp_models()
         self.mp = mp
         self.swap_hands = swap_hands
+        self._last_ts = -1
 
         self.pose = vision.PoseLandmarker.create_from_options(
             vision.PoseLandmarkerOptions(
@@ -131,17 +132,33 @@ class LandmarkExtractor:
         self.close()
 
     def extract(self, frame_rgb, timestamp_ms):
-        """frame_rgb: HxWx3 uint8 RGB. Returns ((75, 3) float32, hands_seen: int)."""
+        """frame_rgb: HxWx3 uint8 RGB -> ((75,3) coords, (75,) confidence, hands_seen).
+
+        Confidences mirror the `confidences` array the .pkl dataset carries, so
+        preprocess.encode can discard guessed landmarks identically on both
+        sides. Pose landmarks report their own visibility; hand landmarks have
+        no per-point score, so they inherit the handedness score.
+        """
+        # VIDEO mode rejects a timestamp that doesn't advance. Millisecond
+        # rounding collides whenever the loop runs faster than 1 kHz, so nudge
+        # instead of letting MediaPipe raise mid-stream.
+        timestamp_ms = max(int(timestamp_ms), self._last_ts + 1)
+        self._last_ts = timestamp_ms
+
         mp_image = self.mp.Image(image_format=self.mp.ImageFormat.SRGB, data=frame_rgb)
 
         pose_result = self.pose.detect_for_video(mp_image, timestamp_ms)
         hand_result = self.hands.detect_for_video(mp_image, timestamp_ms)
 
         kp = np.zeros((config.NUM_LANDMARKS, 3), dtype=np.float32)
+        conf = np.zeros(config.NUM_LANDMARKS, dtype=np.float32)
 
         if pose_result.pose_landmarks:
             for i, lm in enumerate(pose_result.pose_landmarks[0][: config.NUM_POSE_LANDMARKS]):
                 kp[i] = (lm.x, lm.y, lm.z)
+                # MediaPipe reports all 33 pose points even when it can only
+                # infer them; visibility is what separates seen from guessed.
+                conf[i] = getattr(lm, "visibility", 1.0)
 
         # Hand blocks start right after the pose block: left at 33, right at 54.
         left_start = config.NUM_POSE_LANDMARKS
@@ -150,42 +167,53 @@ class LandmarkExtractor:
         hands_seen = 0
         for hand_lms, handedness in zip(hand_result.hand_landmarks, hand_result.handedness):
             label = handedness[0].category_name  # "Left" / "Right"
+            score = float(getattr(handedness[0], "score", 1.0))
             if self.swap_hands:
                 label = "Right" if label == "Left" else "Left"
             start = left_start if label == "Left" else right_start
             for i, lm in enumerate(hand_lms[: config.NUM_HAND_LANDMARKS]):
                 kp[start + i] = (lm.x, lm.y, lm.z)
+                conf[start + i] = score
             hands_seen += 1
 
-        return kp, hands_seen
+        return kp, conf, hands_seen
 
 
 def sequence_from_video(video_path, max_frames=config.MAX_FRAMES, swap_hands=False):
     """Encode a video file into one (max_frames, 225) sequence, same rules as training."""
     import cv2
 
+    from src import preprocess
+
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open video: {video_path}")
 
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames = []
+    kps, confs = [], []
     with LandmarkExtractor(swap_hands=swap_hands) as ex:
         idx = 0
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            kp, _ = ex.extract(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), int(idx * 1000 / fps))
-            frames.append(kp.reshape(-1))
+            kp, conf, _ = ex.extract(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                     int(idx * 1000 / fps))
+            kps.append(kp)
+            confs.append(conf)
             idx += 1
     cap.release()
 
-    if not frames:
+    if not kps:
         raise RuntimeError(f"No frames decoded from {video_path}")
 
-    seq = np.array(frames, dtype=np.float32)
-    if len(seq) < max_frames:
-        pad = np.zeros((max_frames - len(seq), seq.shape[1]), dtype=np.float32)
-        seq = np.vstack([seq, pad])
-    return seq[:max_frames]
+    seq = preprocess.encode(np.stack(kps), np.stack(confs),
+                            aspect=(w / h) if h else 1.0, max_frames=max_frames)
+    if seq is None:
+        raise RuntimeError(
+            f"Could not find shoulders in {video_path} — the signer needs to be "
+            "visible from the torso up."
+        )
+    return seq

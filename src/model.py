@@ -43,12 +43,23 @@ class SignTransformer(nn.Module):
             nn.Linear(128, num_classes)
         )
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask=None):
+        """x: (B, T, input_dim). key_padding_mask: (B, T) bool, True = ignore.
+
+        Preprocessing resamples every clip to exactly max_len real frames, so
+        there is normally nothing to mask. The argument exists so that padded
+        batches are handled correctly rather than letting the CLS token pool
+        over filler.
+        """
         x = self.input_proj(x)
         cls = self.cls_token.expand(x.size(0), -1, -1)
         x = torch.cat([cls, x], dim=1)
         x = self.pos_encoder(x)
-        x = self.transformer(x)
+        if key_padding_mask is not None:
+            # The CLS token is always attended to, so prepend a False column.
+            keep_cls = torch.zeros(x.size(0), 1, dtype=torch.bool, device=x.device)
+            key_padding_mask = torch.cat([keep_cls, key_padding_mask], dim=1)
+        x = self.transformer(x, src_key_padding_mask=key_padding_mask)
         return self.classifier(x[:, 0, :])
 
 
@@ -68,6 +79,7 @@ def save_bundle(model, class_names, path, num_classes=None, **cfg_overrides):
         "model_state_dict": model.state_dict(),
         "class_names": list(class_names),
         "config": cfg,
+        "preprocess_version": config.PREPROCESS_VERSION,
     }, path)
     return path
 
@@ -81,6 +93,18 @@ def load_bundle(path=None, map_location="cpu"):
         raise ValueError(
             f"{path} is not a full bundle (no 'model_state_dict'). "
             "It looks like a bare state_dict — retrain, or run `train` to regenerate it."
+        )
+
+    version = bundle.get("preprocess_version", 1)
+    if version != config.PREPROCESS_VERSION:
+        raise ValueError(
+            f"{path} was trained with preprocessing v{version}, but this code "
+            f"builds features with v{config.PREPROCESS_VERSION}.\n\n"
+            "The weights load fine and the predictions would look plausible — they "
+            "would just be wrong, because the numbers going in no longer mean what "
+            "they meant during training.\n\n"
+            "Retrain to regenerate the bundle:  python main.py train\n"
+            "(the cached X.npy re-encodes itself when it's out of date)"
         )
 
     cfg = dict(bundle["config"])

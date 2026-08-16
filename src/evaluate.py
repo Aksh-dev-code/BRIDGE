@@ -87,6 +87,7 @@ def predict_loader(model, loader, dev):
 def topk_accuracy(model, loader, k, dev):
     model.eval()
     correct, total = 0, 0
+    k = max(1, k)
     with torch.no_grad():
         for xb, yb in loader:
             xb, yb = xb.to(dev), yb.to(dev)
@@ -134,7 +135,10 @@ def evaluate(model=None, val_loader=None, class_names=None, plots=True, show=Non
 
     if all_preds is None:
         all_preds, all_labels, all_confs = predict_loader(model, val_loader, dev)
-        topk = {k: topk_accuracy(model, val_loader, k, dev) for k in (1, 3, 5)}
+        # torch.topk raises if k exceeds the number of classes, so a small
+        # label set only gets the ks that exist.
+        topk = {k: topk_accuracy(model, val_loader, k, dev)
+                for k in (1, 3, 5) if k <= num_classes}
         _save_cache(all_preds, all_labels, all_confs, class_names, topk)
 
     val_acc = (all_preds == all_labels).mean()
@@ -191,7 +195,9 @@ def _print_summary(s):
     print("PERFORMANCE SUMMARY")
     print("=" * 60)
     print(f"  Validation accuracy : {s['val_acc']:.2%}")
-    print(f"  Top-3 / Top-5       : {s['topk'][3]:.2%} / {s['topk'][5]:.2%}")
+    extra = " / ".join(f"Top-{k} {s['topk'][k]:.2%}" for k in (3, 5) if k in s["topk"])
+    if extra:
+        print(f"  {'':20s}{extra}")
     print(f"  Classes             : {s['num_classes']}  ({s['val_samples']} val samples)")
     print(f"  Perfect classes     : {s['perfect_classes']} (F1 = 1.00)")
     print(f"  Failed classes      : {s['failed_classes']} (F1 = 0.00)")

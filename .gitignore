@@ -13,3 +13,6 @@ models/mp_models/
 
 __pycache__/
 *.pyc
+
+data/
+results/
